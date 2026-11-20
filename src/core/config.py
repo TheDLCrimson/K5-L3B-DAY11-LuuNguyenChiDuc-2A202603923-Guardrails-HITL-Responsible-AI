@@ -139,11 +139,23 @@ def get_red_provider() -> str:
     ).strip().lower()
     if raw in {"gemini", "google", "adk"}:
         return PROVIDER_GEMINI
+    if raw == "openrouter":
+        return PROVIDER_OPENROUTER
     return PROVIDER_OPENAI
+
+
+# Red through OpenRouter: the same Gemini model as the lab default, reached over
+# OpenRouter's OpenAI-compatible API (own quota and billing, no Google free-tier cap).
+OPENROUTER_RED_MODEL = "google/gemini-3.5-flash"
 
 
 def get_red_model() -> str:
     """Model Red Team từ .env (cùng cho default + advance)."""
+    if get_red_provider() == PROVIDER_OPENROUTER:
+        return (
+            os.environ.get("RED_OPENROUTER_MODEL", OPENROUTER_RED_MODEL).strip()
+            or OPENROUTER_RED_MODEL
+        )
     if get_red_provider() == PROVIDER_GEMINI:
         return (
             os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL).strip()
@@ -170,6 +182,8 @@ def get_openai_api_key() -> str:
 
 
 def red_openai_client_kwargs() -> dict:
+    if get_red_provider() == PROVIDER_OPENROUTER:
+        return blue_client_kwargs()  # same OpenRouter key and base URL as Blue
     return {"api_key": get_openai_api_key() or None}
 
 
@@ -180,7 +194,8 @@ def red_provider_label(tier: str = "advance") -> str:
 
 
 def red_uses_openai_sdk() -> bool:
-    return get_red_provider() == PROVIDER_OPENAI
+    """True for every OpenAI-compatible Red route: OpenAI itself and OpenRouter."""
+    return get_red_provider() in (PROVIDER_OPENAI, PROVIDER_OPENROUTER)
 
 
 def red_uses_gemini() -> bool:
@@ -248,7 +263,9 @@ def setup_api_key():
         if not os.environ.get("GOOGLE_API_KEY", "").strip():
             os.environ["GOOGLE_API_KEY"] = input("Enter Google API Key (Red): ").strip()
         os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "0"
-        print(f"Red / Red Advance  — gemini:{model}")
+        print(f"Red / Red Advance  - gemini:{model}")
+    elif red == PROVIDER_OPENROUTER:
+        print(f"Red / Red Advance  - openrouter:{model} (same OpenRouter key as Blue)")
     else:
         if not get_openai_api_key():
             os.environ["OPENAI_API_KEY"] = input("Enter OpenAI API Key (Red): ").strip()
