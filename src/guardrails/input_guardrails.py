@@ -11,6 +11,7 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -42,8 +43,55 @@ InputStatus = Literal["ALLOW", "BLOCK"]
 # Regex is one signal, not the whole security boundary.
 # ============================================================
 
+def normalize_text(text: str) -> str:
+    """Canonical form used by every input check.
+
+    1. NFKC folds look-alike forms (fullwidth letters, ligatures) into plain ones.
+    2. Format characters (Unicode category Cf: zero-width space/joiner, BOM,
+       bidi overrides) are deleted, so ``Ignore\\u200b all`` becomes ``Ignore all``.
+    3. Vietnamese diacritics are stripped (``bỏ qua`` -> ``bo qua``, ``đ`` -> ``d``),
+       so accented and unaccented spellings hit the same pattern.
+    4. Lower-case and collapse whitespace runs to one space.
+    """
+    text = unicodedata.normalize("NFKC", text or "")
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
+    text = text.replace("đ", "d").replace("Đ", "D")
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+# Run on normalize_text() output, so patterns are lower-case and unaccented.
+INJECTION_PATTERNS = [
+    # Instruction override: "ignore all previous instructions", "disregard your rules".
+    r"\b(ignore|disregard|forget|override|bypass)\b.{0,25}\b(instructions?|rules|prompts?|directives|guidelines|polic(y|ies))\b",
+    # Role reassignment: "you are now DAN", "from now on you are".
+    r"\byou are now\b|\bfrom now on,? you (are|will)\b",
+    # Asking about the hidden prompt itself.
+    r"\b(system|initial|hidden|original) (prompt|message|instructions?)\b",
+    # Extraction: "reveal your instructions", "print the internal password".
+    r"\b(reveal|show|print|display|repeat|output|leak|dump|tell me)\b.{0,30}\b(your|the|system|internal|hidden|admin)\b.{0,20}\b(instructions?|prompt|rules|config(uration)?|password|api ?key|secrets?|credentials?)\b",
+    # Persona play: "pretend you are", "act as an unrestricted AI".
+    r"\bpretend (you are|you're|to be)\b",
+    r"\bact as\b.{0,15}\b(unrestricted|unfiltered|uncensored|jailbroken|dan|root|admin)\b",
+    r"\b(dan|developer|god) mode\b|\bjailbr(eak|oken)\b",
+    # Fake role tags smuggled into an email / RAG document.
+    r"(^|\s)(###\s*)?(system|assistant)\s*:|\[/?(system|inst)\]|<\|?(system|im_start)\|?>",
+    r"\bnew (instructions|rules)\s*:",
+    # Vietnamese, unaccented after normalisation.
+    r"\b(bo qua|phot lo|quen( het| moi)?)\b.{0,20}\b(huong dan|chi dan|lenh|quy tac)\b",
+    r"\bban (bay gio|gio) la\b|\bgia vo (ban |la )",
+    r"\b(tiet lo|cho (toi )?xem|in ra)\b.{0,20}\b(mat khau|system prompt|api ?key|bi mat|cau hinh)\b",
+]
+
+
 def detect_injection(user_input: str) -> InputStatus:
     """Detect prompt injection patterns in user input.
+
+    The text is normalised first (``normalize_text``), so hidden Unicode and
+    accents cannot split a keyword. The patterns look for an *instruction* to the
+    model, not for the presence of external data: "summarise this external email
+    about a delayed transfer" is a normal request and passes.
 
     Args:
         user_input: The user's message
@@ -51,14 +99,9 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
-    INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
-    ]
-
+    normalized = normalize_text(user_input)
     for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+        if re.search(pattern, normalized):
             return "BLOCK"
     return "ALLOW"
 
@@ -84,14 +127,31 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    normalized = normalize_text(user_input)
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    # 1. A blocked topic wins even inside a banking sentence
+    #    ("transfer money to buy drugs" is still blocked).
+    if any(_has_term(normalized, t) for t in BLOCKED_TOPICS):
+        return "BLOCK"
+    # 2. No banking signal at all -> off-topic.
+    if not any(_has_term(normalized, t) for t in ALLOWED_TOPICS + EXTRA_BANKING_TERMS):
+        return "BLOCK"
+    # 3. On-topic and clean.
+    return "ALLOW"
 
-    pass  # Replace with your implementation
+
+# Common banking words missing from config.ALLOWED_TOPICS; without them
+# "What are VinBank's card fees?" would be a false positive.
+EXTRA_BANKING_TERMS = ["bank", "card", "mortgage", "statement", "sao ke", "ty gia", "exchange rate"]
+
+
+def _has_term(normalized: str, term: str) -> bool:
+    """Whole-word match with a short suffix (loan -> loans, hack -> hacking).
+
+    Plain substring matching would block "skill" for "kill" and allow
+    "stockholder" for "stock"; the leading word boundary stops that.
+    """
+    return re.search(rf"\b{re.escape(term)}\w{{0,4}}\b", normalized) is not None
 
 
 # ============================================================
@@ -112,6 +172,9 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         super().__init__(name="input_guardrail")
         self.blocked_count = 0
         self.total_count = 0
+        # Why the last message was blocked ("injection" / "topic"), None if it passed.
+        # The CP3 suite and audit log read this to fill the ``layer`` field.
+        self.last_block_reason: str | None = None
 
     def _extract_text(self, content: types.Content) -> str:
         """Extract plain text from a Content object."""
@@ -142,16 +205,29 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
             types.Content if message is blocked (return replacement)
         """
         self.total_count += 1
+        self.last_block_reason = None
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        # Injection is checked first: it is the more dangerous signal, and an
+        # attack wrapped in banking words would otherwise pass the topic check.
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            self.last_block_reason = "injection"
+            return self._block_response(
+                "Your message was blocked by VinBank's input guardrail: it looks like an "
+                "attempt to change the assistant's instructions. I can help with accounts, "
+                "transfers, savings, loans and cards."
+            )
 
-        pass  # Replace with your implementation
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            self.last_block_reason = "topic"
+            return self._block_response(
+                "Sorry, I can only help with VinBank banking topics such as accounts, "
+                "transfers, savings, loans and credit cards."
+            )
+
+        return None  # both checks ALLOW -> message goes on to the model
 
 
 # ============================================================
