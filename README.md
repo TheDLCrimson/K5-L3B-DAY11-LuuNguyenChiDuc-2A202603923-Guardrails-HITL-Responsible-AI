@@ -6,6 +6,32 @@
 
 ---
 
+## Submission details
+
+- Student: Lưu Nguyễn Chí Đức (Crimson), student ID 2A202603923, class L3B.
+- GitHub: `TheDLCrimson`.
+- Lab: Day 11, Guardrails, HITL and Responsible AI (individual).
+
+How to run, from the repo root, after `pip install -r requirements.txt` and filling `.env` from `.env.example`:
+
+```bash
+python src/main.py --part 2    # CP2: input and output guardrails, printed to the terminal
+python src/main.py --part 3    # CP3: pipeline suite, writes outputs/results.json, audit_log.json, metrics.json
+python src/main.py --part 4    # CP4: red-team prompts on Red and Red Advance, writes the attack JSON files
+pytest tests/smoke -q && pytest tests/public -q
+python scripts/grade.py --submission-dir . --out outputs/grade_report.json
+```
+
+Implementation notes:
+
+- Blue runs on OpenRouter `liquid/lfm-3-1.7b` (the paid route of the same model, to avoid free-tier rate limits).
+- Red and Red Advance run `google/gemini-3.5-flash` through OpenRouter (`RED_TEAM_PROVIDER=openrouter`), as agreed with the coach.
+  The `llm_provider` and `llm_model` in `outputs/attack_results.json` state this route.
+- The CP3 pipeline runs the plugins itself (`DefensePipeline` in `src/assignment/pipeline.py`) so each request carries its own user id for the rate limiter.
+- Every file in `outputs/` was produced by the commands above, none by hand.
+
+---
+
 ## Thời lượng
 
 | Phần | Thời gian |
